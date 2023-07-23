@@ -1,0 +1,14 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.adapterTargetName": "esp32",
+  "files.associations": {
+    "esp_bt_device.h": "c",
+    "esp_bt_main.h": "c",
+    "task.h": "c",
+    "freertos.h": "c",
+    "bitset": "c",
+    "chrono": "c",
+    "algorithm": "c",
+    "btc_spp.h": "c"
+  }
+}
