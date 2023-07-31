@@ -33,7 +33,7 @@
 #define LOGPASS "LOG_PASS"
 #define EXTRUI "EXTRACT_ELEMENT"
 #define SPP_SERVER_NAME "SPP_SERVER"
-#define EXAMPLE_DEVICE_NAME "ESP_SPP_ACCEPTOR"
+#define EXAMPLE_DEVICE_NAME "LOG3spe2"
 #define SPP_SHOW_DATA 0
 #define SPP_SHOW_SPEED 1
 #define SPP_SHOW_MODE SPP_SHOW_DATA    /*Choose show mode: show data or speed*/
@@ -645,6 +645,7 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     default: {
         ESP_LOGI(SPP_TAG, "event: %d", event);
         break;
+        
     }
     }
     return;
