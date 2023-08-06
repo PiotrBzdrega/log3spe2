@@ -57,10 +57,12 @@ typedef enum UI_ENUM
     UI_DOMAIN = 0,
     UI_LOGIN = 1,
     UI_PASSWORD = 2,
-    UI_DONE = 3,
-    UI_NEW_CREDENTIAL = 4,
-    UI_DELETE_ALL = 5,
-    UI_MISSED = 6,
+    UI_LOGPASS =3,
+    UI_DONE = 4,
+    UI_NEW_CREDENTIAL = 5,
+    UI_DELETE_ALL = 6,
+    UI_MISSED = 7,
+    UI_FAIL = 8,
     
 }UI_ENUM;
 
@@ -76,7 +78,7 @@ static uint8_t* mode_to_str(esp_bt_pm_mode_t mode)
 static UI_ENUM telegram_mode(uint8_t ch)
 {   
     uint8_t mode=ch-(uint8_t)'0';
-    return (mode>UI_UNKNOWN && mode<=UI_MISSED) ? mode : UI_UNKNOWN;
+    return (mode>UI_UNKNOWN && mode<=UI_FAIL) ? mode : UI_UNKNOWN;
 }
 
 static char *bda2str(uint8_t * bda, char *str, size_t size)
@@ -98,7 +100,7 @@ typedef struct
     uint8_t           *data;          /*!< The data received */       
 }rcv_tele;
 
-static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t* logpass,int32_t handle)
+static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t* log, const uint8_t* pass, int32_t handle)
 {
 
     if (element==UI_UNKNOWN || element>=10)
@@ -131,17 +133,30 @@ static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t*
         /*go through each character of domain*/
         while ((*tmp++=*domain++)!='\0');
 
-        /* move back pointer for null terminator position*/
-        tmp--;
-
         /* login pointer valid */
-        if(logpass)
+        if(log)
         {   
+            /* move back pointer for null terminator position*/
+            tmp--;
+
             /*put comma separator insted '\0'*/
             *tmp++ =EXT;
 
             /*go through each character of login/password*/
-            while ((*tmp++=*logpass++)!='\0');
+            while ((*tmp++=*log++)!='\0');
+        }
+
+        /* password pointer valid */
+        if(pass)
+        {   
+            /* move back pointer for null terminator position*/
+            tmp--;
+
+            /*put comma separator insted '\0'*/
+            *tmp++ =EXT;
+
+            /*go through each character of login/password*/
+            while ((*tmp++=*pass++)!='\0');
         }
                 esp_err_t res=esp_spp_write(handle, (tmp-(uint8_t*)&message), (uint8_t*)&message);
                 ESP_LOGI(CRE_MSG, "invoked esp_spp_write status :%s",esp_err_to_name(res));
@@ -182,8 +197,7 @@ static uint8_t* logpass_concat(uint8_t* login, uint8_t* password)
 
     /* allocate sufficcient area for concatenated string*/
     uint8_t *logpass= (uint8_t*)malloc(sizeof(uint8_t)*len);
-
-    ESP_LOGI(LOGPASS, " allocated %d bytes for logpass",len);
+    ESP_LOGI(LOGPASS, "Allocated %d bytes for:%p pointer ",sizeof(uint8_t)*len,logpass);
 
     /* keep address of logpass to combine strings*/    
     tmp=logpass;
@@ -203,8 +217,7 @@ static uint8_t* logpass_concat(uint8_t* login, uint8_t* password)
     while ((*tmp++=*password++)!='\0');
     
 
-    ESP_LOGI(LOGPASS, " login%cpassword has been concatenated :%s",EXT,logpass); 
-                                                                            
+    ESP_LOGI(LOGPASS, " login%cpassword has been concatenated :%s",EXT,logpass);                                                                       
 
     return logpass;
 }
@@ -233,7 +246,7 @@ static bool add_to_nvs(uint8_t* credential[3])
             return false;
         }
         ESP_LOGI(ADD_NVS, "before call nvs_set_str() key:%s, len:%d, value:%s, len:%d",(char*)credential[0],strlen((char*)credential[0]),(char*)new_value,strlen((char*)new_value));
-        /* populate key with new login*/
+        /* populate key(domain) with new login*/
         err = nvs_set_str(my_handle, (char*)credential[0], (char*)new_value);
         ESP_LOGI(ADD_NVS, "invoked nvs_set_str() with status :%s\t key:%s, value:%s",esp_err_to_name(err),credential[0],new_value);
 
@@ -241,8 +254,11 @@ static bool add_to_nvs(uint8_t* credential[3])
         err = nvs_commit(my_handle);
         ESP_LOGI(ADD_NVS, "invoked commit() with status :%s",esp_err_to_name(err));
 
+
+        ESP_LOGI(ADD_NVS, "Release memory for:%p pointer ",new_value);
         /* release memory for concatenated value*/
         free(new_value);
+
         return true;
     }
 }
@@ -253,9 +269,7 @@ static uint8_t* extract_credential(UI_ENUM element,uint8_t* logpass)
     uint8_t *org=logpass;
 
     /* iterate till separator character*/
-    while (*(logpass++)!=EXT)
-    ;
-
+    while (*(logpass++)!=EXT);
 
     /* UI_LOGIN has been requested */
     if (element==UI_LOGIN)
@@ -268,18 +282,23 @@ static uint8_t* extract_credential(UI_ENUM element,uint8_t* logpass)
         ESP_LOGI(EXTRUI, "extracted UI_LOGIN :%s",org);
     }
     /* UI_PASSWORD has been requested */
-    else
+    else if (element==UI_PASSWORD)
     {   /* save orginal addres of logpass*/
         uint8_t *tmp=org;
         while ((*tmp++=*logpass++)!='\0');
         
         ESP_LOGI(EXTRUI, "extracted UI_PASSWORD :%s",org);       
     }
+    else
+    {
+        ESP_LOGE(EXTRUI, "wrong UI_ENUM : %d , cannot extract credential",element);  
+        return NULL;
+    }
     
     return org;
 }
 
-static uint8_t* find_in_nvs(UI_ENUM element,uint8_t *domain)
+static uint8_t* find_in_nvs(uint8_t *key)
 {
     esp_err_t err;
     nvs_handle_t my_handle;
@@ -295,28 +314,31 @@ static uint8_t* find_in_nvs(UI_ENUM element,uint8_t *domain)
         size_t required_size;
 
         /* get require size w/o any pointer */
-        err=nvs_get_str(my_handle, (char*)domain, NULL, &required_size);
+        err=nvs_get_str(my_handle, (char*)key, NULL, &required_size);
         if (err != ESP_OK)
         {
-            ESP_LOGE(FIN_NVS, "Error %s during call nvs_get_str() for key:%s!",esp_err_to_name(err),(char*)domain);
+            ESP_LOGE(FIN_NVS, "Error %s during call nvs_get_str() for key:%s!",esp_err_to_name(err),(char*)key);
             return NULL;
         }
-        ESP_LOGI(FIN_NVS, "Required %d bytes of memory for key:%s allocation ",required_size,domain);
+        ESP_LOGI(FIN_NVS, "Required %d bytes of memory for key:%s allocation ",required_size,key);
 
         /* allocate required space for credential */
         uint8_t *logpass= (uint8_t*)malloc(required_size);
 
+        ESP_LOGI(FIN_NVS, "Allocated %d bytes for:%p pointer ",required_size,logpass);
+
         /* invoke get function once again w/ pointer*/ 
-        err=nvs_get_str(my_handle, (char*)domain, (char*)logpass, &required_size);
+        err=nvs_get_str(my_handle, (char*)key, (char*)logpass, &required_size);
         if (err != ESP_OK)
         {
+            free(logpass);
             ESP_LOGE(FIN_NVS, "Error %s during call invoked nvs_get_str()!",esp_err_to_name(err));
             return NULL;
         }
-        ESP_LOGI(FIN_NVS, "Aquired %s value for key:%s allocation ",logpass,domain);
+        ESP_LOGI(FIN_NVS, "Aquired %s value for key:%s allocation ",logpass,key);
 
-        /* return required credential part*/
-        return extract_credential(element,logpass);
+        /* return found whole credential stored in nvs */
+        return logpass;
     }
     return NULL;
 }
@@ -339,7 +361,7 @@ static void process_telegram(void *arg)
              UI_ENUM mode=telegram_mode(tel->data[0]); //TODO:prio!!!correct functionality to not catch other letters
 
             /*valid mode in telegram*/
-            if(mode)
+            if(mode>UI_UNKNOWN)
             {
                 /*telegram should contains at most 3 additional text places mode,domain,login,password*/
                 uint8_t* content[3];
@@ -366,6 +388,9 @@ static void process_telegram(void *arg)
                             
                             /*allocate memory for found element (+1 for null terminator)*/
                             content[j]=(uint8_t *)malloc(sizeof(uint8_t)*(end_char-start_char+1));
+
+                            ESP_LOGI(TEL_TAG, "Allocated %d bytes for:%p pointer ",sizeof(uint8_t)*(end_char-start_char+1),content[j]);
+
                             memcpy(content[j],&tel->data[start_char],(end_char-start_char+1));
 
                             /* replace seperator character with null terminator*/
@@ -390,22 +415,57 @@ static void process_telegram(void *arg)
                         if (j==1)
                         {   
                             /*search credential in non-volatile storage memory*/
-                            uint8_t* credential=find_in_nvs(mode,(uint8_t*)content[0]);
+                            uint8_t* credential=find_in_nvs((uint8_t*)content[0]);
 
                             /* credential found; create message with found item*/
                             if(credential)
-                                create_message(mode,content[0],credential,tel->handle);
+                            {   
+                                uint8_t* element_cred=extract_credential(mode,credential);
+                                create_message(mode,content[0],element_cred,NULL, tel->handle);
+
+                                ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",credential);
+                                /* clean up after msg has been created*/
+                                free(credential);
+                            }
                             else
                             {       
                                 // ESP_LOGE(TEL_TAG, "%s for domain:%s missed in NVS",(mode==UI_LOGIN) ? "UI_LOGIN" : "UI_PASSWORD",content[0]); //redundant message
                                 /* create message w/o credential*/
-                                create_message(UI_MISSED,content[0],NULL,tel->handle);
+                                create_message(UI_MISSED,content[0],NULL,NULL,tel->handle);
                             }
-
                         }
                         else
                             ESP_LOGE(TEL_TAG, "Invalid amount of elements in telegram:%d",j);                        
+                        break;
+                    case UI_LOGPASS:
+                        ESP_LOGI(TEL_TAG, "UI_LOGPASS telegram:%s",tel->data);
 
+                        /*telegram should contains only one element*/
+                        if (j==1)
+                        {   
+                            /*search credential in non-volatile storage memory*/
+                            uint8_t* credential=find_in_nvs((uint8_t*)content[0]);
+
+                            /* credential found; create message with found item*/
+                            if(credential)
+                            {
+                                uint8_t* pass_cred=extract_credential(UI_PASSWORD,credential);
+                                uint8_t* log_cred=extract_credential(UI_LOGIN,credential);
+                                create_message(mode,content[0],credential,NULL, tel->handle);   
+
+                                ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",credential);
+                                /* clean up after msg has been created*/
+                                free(credential);        
+                            }
+                                
+                            else
+                            {       
+                                // ESP_LOGE(TEL_TAG, "%s for domain:%s missed in NVS",(mode==UI_LOGIN) ? "UI_LOGIN" : "UI_PASSWORD",content[0]); //redundant message
+                                /* create message w/o credential*/
+                                create_message(UI_MISSED,content[0],NULL,NULL,tel->handle);
+                            }
+
+                        }
 
                         break;
                     case UI_DONE:
@@ -429,7 +489,11 @@ static void process_telegram(void *arg)
                     case UI_MISSED:
                         ESP_LOGI(TEL_TAG, "UI_MISSED telegram:%s",tel->data);
                         //TODO: missed telegram
-                        break;                                                                                 
+                        break;    
+                   case UI_FAIL:
+                        ESP_LOGI(TEL_TAG, "UI_FAIL telegram:%s",tel->data);
+                        //TODO: missed telegram
+                        break;                                                                               
                     default:
                         ESP_LOGE(TEL_TAG, "Undifined mode telegram:%s",tel->data);
                         break;
@@ -437,7 +501,11 @@ static void process_telegram(void *arg)
         
                     /*release memory for extracted elements from telegram*/
                     while(--j)
-                        free(content[j]);
+                    {
+                        ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",content[j]);
+                        free(content[j]); 
+                    }
+                        
 
                 }
                 else
@@ -451,8 +519,11 @@ static void process_telegram(void *arg)
             
 
 
-            /*release memory for original telegram after reading data*/      
+            /*release memory for original telegram after reading data*/  
+            ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",tel->data);    
             free(tel->data);
+
+            ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",tel);    
             free(tel);
         }
     }
@@ -523,12 +594,16 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 
             /* memory allocation for telegram string */
             uint8_t* telegram=(uint8_t *)malloc(sizeof(uint8_t)*(param->data_ind.len+1));
+            ESP_LOGI(SPP_TAG, "Allocated %d bytes for:%p pointer ",sizeof(uint8_t)*(param->data_ind.len+1),telegram);
+
             memcpy(telegram,param->data_ind.data,param->data_ind.len);
             telegram[param->data_ind.len]='\0';
             printf("%s\t %d\n",telegram,param->data_ind.len);
             
             /* memory allocation for struct to be stored in queue */
             rcv_tele *new_telegram=(rcv_tele*) malloc(sizeof(rcv_tele*));
+            ESP_LOGI(SPP_TAG, "Allocated %d bytes for:%p pointer ",sizeof(rcv_tele*),new_telegram);
+
             new_telegram->data=telegram;
             new_telegram->len=param->data_ind.len;
             new_telegram->handle=param->data_ind.handle;
@@ -571,8 +646,8 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         ESP_LOGI(SPP_TAG, "ESP_SPP_SRV_OPEN_EVT status:%d handle:%"PRIu32", rem_bda:[%s]", param->srv_open.status,
                  param->srv_open.handle, bda2str(param->srv_open.rem_bda, bda_str, sizeof(bda_str)));
         gettimeofday(&time_old, NULL);
-        //TODO: 2.SPP connection opened -> say hello
-        // esp_err_t res=esp_spp_write(param->srv_open.handle, 4, (uint8_t*)"wit");
+        ESP_LOGI(SPP_TAG, "SAY HELLO TO LOG PC");
+        create_message(UI_DOMAIN,NULL,NULL,NULL,param->srv_open.handle);
         break;
     case ESP_SPP_SRV_STOP_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_SRV_STOP_EVT");
@@ -733,4 +808,5 @@ void app_main(void)
 
     
 
+//TODO: RSA encryption https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/api-reference/peripherals/ds.html
 }
