@@ -9,6 +9,15 @@
     "bitset": "c",
     "chrono": "c",
     "algorithm": "c",
-    "btc_spp.h": "c"
+    "btc_spp.h": "c",
+    "*.tcc": "c",
+    "ratio": "c",
+    "system_error": "c",
+    "array": "c",
+    "functional": "c",
+    "regex": "c",
+    "tuple": "c",
+    "type_traits": "c",
+    "utility": "c"
   }
 }

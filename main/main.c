@@ -21,6 +21,18 @@
 #include "esp_spp_api.h"
 #include "freertos/queue.h"
 
+#include "driver/gpio.h"
+#include "driver/touch_pad.h"
+#include "freertos/timers.h"
+#define BLUE_LED GPIO_NUM_2
+#define TOUCH_THRESH_NO_USE   (0)
+#define TOUCH_PAD_IO (0)
+#define TOUCH_THRESH_PERCENT  (80)
+#define TOUCHPAD_FILTER_TOUCH_PERIOD (10)
+#define TCH_PAD "TOUCH_PAD"
+#define RNW_TIM "RENEW_TIMER"
+#define TIM_CB "TIMER_CALLBACK"
+
 #include "time.h"
 #include "sys/time.h"
 
@@ -28,27 +40,34 @@
 #define TEL_TAG "TELEGRAM_PROCESS"
 #define CRE_MSG "CREATE_MESSAGE"
 #define ADD_NVS "ADD_NVS"
+#define ERA_NVS "ERASE_NVS"
 #define FIN_NVS "FIND_NVS"
 #define REM_NVS "REMOVE_NVS"
 #define LOGPASS "LOG_PASS"
 #define EXTRUI "EXTRACT_ELEMENT"
 #define SPP_SERVER_NAME "SPP_SERVER"
+
 #define EXAMPLE_DEVICE_NAME "LOG3spe2"
+
 #define SPP_SHOW_DATA 0
 #define SPP_SHOW_SPEED 1
 #define SPP_SHOW_MODE SPP_SHOW_DATA    /*Choose show mode: show data or speed*/
 #define MAX_TELEGRAM 100
 #define EXT ',' /* separator in telegram*/
-static char credential_cache[100]; //TODO: use domain'ETH'login'ETH'password cache
 static const esp_spp_mode_t esp_spp_mode = ESP_SPP_MODE_CB;
 static const bool esp_spp_enable_l2cap_ertm = true;
 
+// static SemaphoreHandle_t mtx_timer_expired = NULL;
+TimerHandle_t xTimer_inactivity;
 
-static struct timeval time_new, time_old;
-static long data_num = 0;
+static bool connection_established=false; //TODO:MUTEX!!!
+static uint32_t serial_handle=0;
+static struct timeval time_old;
 
 static const esp_spp_sec_t sec_mask = ESP_SPP_SEC_AUTHENTICATE;
 static const esp_spp_role_t role_slave = ESP_SPP_ROLE_SLAVE;
+
+static uint32_t pad_init_val;
 
 /*Telegram enumeration*/
 typedef enum UI_ENUM
@@ -60,10 +79,9 @@ typedef enum UI_ENUM
     UI_LOGPASS =3,
     UI_DONE = 4,
     UI_NEW_CREDENTIAL = 5,
-    UI_DELETE_ALL = 6,
+    UI_ERASE = 6,
     UI_MISSED = 7,
-    UI_FAIL = 8,
-    
+    UI_FAIL = 8,   
 }UI_ENUM;
 
 /* Queue for received telegrams */
@@ -109,14 +127,13 @@ static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t*
         return false;
     }
     
-    /*domain has null pointer*/
-    if(!domain)
-    {
-        ESP_LOGE(CRE_MSG, "Create message failed; domain value missing "); 
-        return false;
-    }
-    else
-    {
+    // /*domain has null pointer*/
+    // if(!domain)
+    // {
+    //     ESP_LOGE(CRE_MSG, "Create message failed; domain value missing "); 
+    //     return false;
+    // }
+        
 
         /* telegram pointer with maximal bytes in buffer */
         uint8_t message[MAX_TELEGRAM];
@@ -127,6 +144,17 @@ static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t*
         /* insert feedback mode into first character of massage*/
         *tmp++= element+'0';
 
+
+        /* null terminatior in case there is no other elements on the way*/
+        *tmp++='\0';
+
+        
+
+    if (domain)
+    {
+        /* move back pointer for null terminator position*/
+        tmp--;
+        
         /* separator character*/
         *tmp++=EXT;
 
@@ -157,12 +185,19 @@ static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t*
 
             /*go through each character of login/password*/
             while ((*tmp++=*pass++)!='\0');
+
         }
-                esp_err_t res=esp_spp_write(handle, (tmp-(uint8_t*)&message), (uint8_t*)&message);
-                ESP_LOGI(CRE_MSG, "invoked esp_spp_write status :%s",esp_err_to_name(res));
-        return (res==0) ? true : false; 
     }
+
+        /* move back pointer for correct message length calculation (tmp-(uint8_t*)&message) */
+        tmp--;
+
+        ESP_LOGI(CRE_MSG, "stored msg :%s with size %d",message,(tmp-(uint8_t*)&message));
+        esp_err_t res=esp_spp_write(handle, (tmp-(uint8_t*)&message), (uint8_t*)&message);
+        ESP_LOGI(CRE_MSG, "invoked esp_spp_write status :%s",esp_err_to_name(res));
+        return (res==0) ? true : false; 
 }
+
 
 static uint8_t* logpass_concat(uint8_t* login, uint8_t* password)
 {
@@ -197,7 +232,7 @@ static uint8_t* logpass_concat(uint8_t* login, uint8_t* password)
 
     /* allocate sufficcient area for concatenated string*/
     uint8_t *logpass= (uint8_t*)malloc(sizeof(uint8_t)*len);
-    ESP_LOGI(LOGPASS, "Allocated %d bytes for:%p pointer ",sizeof(uint8_t)*len,logpass);
+    ESP_LOGI(LOGPASS, "Allocated %d bytes for:%p logpass ",sizeof(uint8_t)*len,logpass);
 
     /* keep address of logpass to combine strings*/    
     tmp=logpass;
@@ -231,10 +266,12 @@ static bool add_to_nvs(uint8_t* credential[3])
 {
     esp_err_t err;
     nvs_handle_t my_handle;
-    err = nvs_open("storage", NVS_READONLY, &my_handle);
+    err = nvs_open("storage", NVS_READWRITE, &my_handle);
     if (err != ESP_OK)
     {
         ESP_LOGE(ADD_NVS, "Error (%s) opening NVS handle to write!\n",esp_err_to_name(err));
+        /* Close the storage handle and free any allocated resources.*/
+        nvs_close(my_handle);
         return false;
     }        
     else
@@ -244,6 +281,8 @@ static bool add_to_nvs(uint8_t* credential[3])
         if(!new_value)
         {
             return false;
+            /* Close the storage handle and free any allocated resources.*/
+            nvs_close(my_handle);
         }
         ESP_LOGI(ADD_NVS, "before call nvs_set_str() key:%s, len:%d, value:%s, len:%d",(char*)credential[0],strlen((char*)credential[0]),(char*)new_value,strlen((char*)new_value));
         /* populate key(domain) with new login*/
@@ -255,9 +294,12 @@ static bool add_to_nvs(uint8_t* credential[3])
         ESP_LOGI(ADD_NVS, "invoked commit() with status :%s",esp_err_to_name(err));
 
 
-        ESP_LOGI(ADD_NVS, "Release memory for:%p pointer ",new_value);
+        ESP_LOGI(ADD_NVS, "Release memory for:%p new_value ",new_value);
         /* release memory for concatenated value*/
         free(new_value);
+
+        /* Close the storage handle and free any allocated resources.*/
+        nvs_close(my_handle);
 
         return true;
     }
@@ -265,27 +307,31 @@ static bool add_to_nvs(uint8_t* credential[3])
 
 static uint8_t* extract_credential(UI_ENUM element,uint8_t* logpass)
 {
+    //TODO: redifine function, logpass should be const to not move pointer 
     /* copy original addres for credential */
     uint8_t *org=logpass;
 
     /* iterate till separator character*/
-    while (*(logpass++)!=EXT);
+    while (*(org++)!=EXT);
 
     /* UI_LOGIN has been requested */
     if (element==UI_LOGIN)
     {
         /* move back to separator position*/
-        logpass--;
+        org--;
 
         /* replace control character with null terminator to limit text*/
-        *logpass='\0';
+        *org='\0';
+
+        /* move pointer back to first character*/
+        org=logpass;
         ESP_LOGI(EXTRUI, "extracted UI_LOGIN :%s",org);
     }
     /* UI_PASSWORD has been requested */
     else if (element==UI_PASSWORD)
     {   /* save orginal addres of logpass*/
-        uint8_t *tmp=org;
-        while ((*tmp++=*logpass++)!='\0');
+        // uint8_t *tmp=org;
+        // while ((*tmp++=*logpass++)!='\0');
         
         ESP_LOGI(EXTRUI, "extracted UI_PASSWORD :%s",org);       
     }
@@ -302,7 +348,7 @@ static uint8_t* find_in_nvs(uint8_t *key)
 {
     esp_err_t err;
     nvs_handle_t my_handle;
-    err = nvs_open("storage", NVS_READWRITE , &my_handle);
+    err = nvs_open("storage", NVS_READONLY , &my_handle);
     if (err != ESP_OK)
     {
         ESP_LOGE(FIN_NVS, "Error (%s) opening NVS handle to read!\n",esp_err_to_name(err));
@@ -318,6 +364,8 @@ static uint8_t* find_in_nvs(uint8_t *key)
         if (err != ESP_OK)
         {
             ESP_LOGE(FIN_NVS, "Error %s during call nvs_get_str() for key:%s!",esp_err_to_name(err),(char*)key);
+            /* Close the storage handle and free any allocated resources.*/
+            nvs_close(my_handle);
             return NULL;
         }
         ESP_LOGI(FIN_NVS, "Required %d bytes of memory for key:%s allocation ",required_size,key);
@@ -325,7 +373,7 @@ static uint8_t* find_in_nvs(uint8_t *key)
         /* allocate required space for credential */
         uint8_t *logpass= (uint8_t*)malloc(required_size);
 
-        ESP_LOGI(FIN_NVS, "Allocated %d bytes for:%p pointer ",required_size,logpass);
+        ESP_LOGI(FIN_NVS, "Allocated %d bytes for:%p logpass ",required_size,logpass);
 
         /* invoke get function once again w/ pointer*/ 
         err=nvs_get_str(my_handle, (char*)key, (char*)logpass, &required_size);
@@ -333,6 +381,8 @@ static uint8_t* find_in_nvs(uint8_t *key)
         {
             free(logpass);
             ESP_LOGE(FIN_NVS, "Error %s during call invoked nvs_get_str()!",esp_err_to_name(err));
+            /* Close the storage handle and free any allocated resources.*/
+            nvs_close(my_handle);
             return NULL;
         }
         ESP_LOGI(FIN_NVS, "Aquired %s value for key:%s allocation ",logpass,key);
@@ -341,6 +391,76 @@ static uint8_t* find_in_nvs(uint8_t *key)
         return logpass;
     }
     return NULL;
+}
+
+static bool erase_from_nvs(uint8_t *key)
+{
+    bool result=true;
+
+    esp_err_t err;
+
+    /* key argument is empty erase all keys*/
+    if (key[0]=='\0')
+    {   
+        nvs_handle_t my_handle;
+        err = nvs_open("storage", NVS_READWRITE , &my_handle);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(FIN_NVS, "Error (%s) opening NVS handle to read!\n",esp_err_to_name(err));
+            return false;
+        } 
+
+        err = nvs_erase_all(my_handle);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(ERA_NVS, "Error %s during call nvs_erase_all() !",esp_err_to_name(err));
+            /* Close the storage handle and free any allocated resources.*/
+            nvs_close(my_handle);
+            return false;
+        }
+        /* Close the storage handle and free any allocated resources.*/
+        nvs_close(my_handle);
+    }
+    /* erase one pair <key,value> */
+    else
+    {
+      /* check if requested key exist*/
+      uint8_t* found_key=find_in_nvs(key);
+
+      /* key found in namespace storage*/
+      if (found_key)
+      {
+        
+        nvs_handle_t my_handle;
+        err = nvs_open("storage", NVS_READWRITE , &my_handle);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(FIN_NVS, "Error (%s) opening NVS handle to read!\n",esp_err_to_name(err));
+            return false;
+        } 
+
+        err = nvs_erase_key(my_handle, (char*)key);
+
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(ERA_NVS, "Error %s during call nvs_erase_key() for key:%s!",esp_err_to_name(err),(char*)key);
+            /* Close the storage handle and free any allocated resources.*/
+            nvs_close(my_handle);
+            return false;
+        }       
+        free(found_key);
+        /* Close the storage handle and free any allocated resources.*/
+        nvs_close(my_handle);
+      }
+      else
+      {
+        /* delete not possible, missing key*/
+        return false;
+      }
+      
+    }
+    
+    return result;
 }
 
 /*Process incomming messages from SPP client*/
@@ -389,7 +509,7 @@ static void process_telegram(void *arg)
                             /*allocate memory for found element (+1 for null terminator)*/
                             content[j]=(uint8_t *)malloc(sizeof(uint8_t)*(end_char-start_char+1));
 
-                            ESP_LOGI(TEL_TAG, "Allocated %d bytes for:%p pointer ",sizeof(uint8_t)*(end_char-start_char+1),content[j]);
+                            ESP_LOGI(TEL_TAG, "Allocated %d bytes for:%p content[%d] ",sizeof(uint8_t)*(end_char-start_char+1),content[j],j);
 
                             memcpy(content[j],&tel->data[start_char],(end_char-start_char+1));
 
@@ -423,7 +543,7 @@ static void process_telegram(void *arg)
                                 uint8_t* element_cred=extract_credential(mode,credential);
                                 create_message(mode,content[0],element_cred,NULL, tel->handle);
 
-                                ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",credential);
+                                ESP_LOGI(TEL_TAG, "Release memory for:%p credential ",credential);
                                 /* clean up after msg has been created*/
                                 free(credential);
                             }
@@ -448,12 +568,12 @@ static void process_telegram(void *arg)
 
                             /* credential found; create message with found item*/
                             if(credential)
-                            {
+                            { 
                                 uint8_t* pass_cred=extract_credential(UI_PASSWORD,credential);
                                 uint8_t* log_cred=extract_credential(UI_LOGIN,credential);
-                                create_message(mode,content[0],credential,NULL, tel->handle);   
+                                create_message(mode,content[0],log_cred,pass_cred, tel->handle);   
 
-                                ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",credential);
+                                ESP_LOGI(TEL_TAG, "Release memory for:%p credential ",credential);
                                 /* clean up after msg has been created*/
                                 free(credential);        
                             }
@@ -470,6 +590,7 @@ static void process_telegram(void *arg)
                         break;
                     case UI_DONE:
                         ESP_LOGI(TEL_TAG, "UI_DONE telegram:%s",tel->data);
+
                         break;
                     case UI_NEW_CREDENTIAL:
                         /*TELEGRAM:UI_ENUM,domain,login,password*/
@@ -477,14 +598,52 @@ static void process_telegram(void *arg)
                         /*telegram should contains three elements*/
                         if (j==3)
                         {  /* add new credential*/
-                            add_to_nvs(content);
+
+                            if (add_to_nvs(content))
+                            {
+                                ESP_LOGI(TEL_TAG, "Succesfully added to nvs domain: %s ",(char*)content[0]);
+                                /* create message w/o credential*/
+                                create_message(UI_DONE,content[0],NULL,NULL,tel->handle);
+                            }
+                            else
+                            {
+                                ESP_LOGI(TEL_TAG, "Fail to add to nvs domain:  %s ",(char*)content[0]);
+                                /* create message w/o credential*/
+                                create_message(UI_FAIL,content[0],NULL,NULL,tel->handle);
+                            }
                         }
                         else
                             ESP_LOGE(TEL_TAG, "Invalid amount of elements in telegram:%d",j);  
 
                         break;
-                    case UI_DELETE_ALL:
-                        ESP_LOGI(TEL_TAG, "UI_DELETE_ALL telegram:%s",tel->data);
+                    case UI_ERASE:
+                        ESP_LOGI(TEL_TAG, "UI_ERASE telegram:%s",tel->data);
+                        /* erase exactly one pair <key,value>*/
+                        bool res=true;
+                        if (j==1)
+                        {
+                            res=erase_from_nvs(content[0]); 
+                        }
+                        /* erase all stored pairs <key,value>*/
+                        else if(j==0)
+                        {
+                            /* create pointer to empty string */
+                            uint8_t *temp = (uint8_t *)"";
+                            res=erase_from_nvs(temp);
+                        }
+
+                        if (res)
+                        {
+                            ESP_LOGI(TEL_TAG, "Succesfully erased from nvs %s ",((j==0) ? "all keys" : (char*)content[0]));
+                            /* create message w/o credential*/
+                            create_message(UI_DONE,content[0],NULL,NULL,tel->handle);
+                        }
+                        else
+                        {
+                            ESP_LOGE(TEL_TAG, "Failed to erase from nvs %s ",((j==0) ? "all keys" : (char*)content[0]));
+                            /* create message w/o credential*/
+                            create_message(UI_FAIL,content[0],NULL,NULL,tel->handle);
+                        }
                         break;
                     case UI_MISSED:
                         ESP_LOGI(TEL_TAG, "UI_MISSED telegram:%s",tel->data);
@@ -500,9 +659,9 @@ static void process_telegram(void *arg)
                     }
         
                     /*release memory for extracted elements from telegram*/
-                    while(--j)
+                    while(--j>=0)
                     {
-                        ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",content[j]);
+                        ESP_LOGI(TEL_TAG, "Release memory for:%p content[%d] ",content[j],j);
                         free(content[j]); 
                     }
                         
@@ -520,25 +679,13 @@ static void process_telegram(void *arg)
 
 
             /*release memory for original telegram after reading data*/  
-            ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",tel->data);    
+            ESP_LOGI(TEL_TAG, "Release memory for:%p tel->data ",tel->data);    
             free(tel->data);
 
-            ESP_LOGI(TEL_TAG, "Release memory for:%p pointer ",tel);    
+            ESP_LOGI(TEL_TAG, "Release memory for:%p tel; ",tel);    
             free(tel);
         }
     }
-}
-
-static void print_speed(void)
-{
-    float time_old_s = time_old.tv_sec + time_old.tv_usec / 1000000.0;
-    float time_new_s = time_new.tv_sec + time_new.tv_usec / 1000000.0;
-    float time_interval = time_new_s - time_old_s;
-    float speed = data_num * 8 / time_interval / 1000.0;
-    ESP_LOGI(SPP_TAG, "speed(%fs ~ %fs): %f kbit/s" , time_old_s, time_new_s, speed);
-    data_num = 0;
-    time_old.tv_sec = time_new.tv_sec;
-    time_old.tv_usec = time_new.tv_usec;
 }
 
 static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
@@ -563,6 +710,8 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
     case ESP_SPP_CLOSE_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_CLOSE_EVT status:%d handle:%"PRIu32" close_by_remote:%d", param->close.status,
                  param->close.handle, param->close.async);
+                 connection_established=false;
+                 serial_handle=0;
         break;
     case ESP_SPP_START_EVT:
         if (param->start.status == ESP_SPP_SUCCESS) {
@@ -579,7 +728,6 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         ESP_LOGI(SPP_TAG, "ESP_SPP_CL_INIT_EVT");
         break;
     case ESP_SPP_DATA_IND_EVT:
-#if (SPP_SHOW_MODE == SPP_SHOW_DATA)
         /*
          * We only show the data in which the data length is less than 128 here. If you want to print the data and
          * the data rate is high, it is strongly recommended to process them in other lower priority application task
@@ -594,7 +742,7 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
 
             /* memory allocation for telegram string */
             uint8_t* telegram=(uint8_t *)malloc(sizeof(uint8_t)*(param->data_ind.len+1));
-            ESP_LOGI(SPP_TAG, "Allocated %d bytes for:%p pointer ",sizeof(uint8_t)*(param->data_ind.len+1),telegram);
+            ESP_LOGI(SPP_TAG, "Allocated %d bytes for:%p telegram ",sizeof(uint8_t)*(param->data_ind.len+1),telegram);
 
             memcpy(telegram,param->data_ind.data,param->data_ind.len);
             telegram[param->data_ind.len]='\0';
@@ -602,7 +750,7 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
             
             /* memory allocation for struct to be stored in queue */
             rcv_tele *new_telegram=(rcv_tele*) malloc(sizeof(rcv_tele*));
-            ESP_LOGI(SPP_TAG, "Allocated %d bytes for:%p pointer ",sizeof(rcv_tele*),new_telegram);
+            ESP_LOGI(SPP_TAG, "Allocated %d bytes for:%p new_telegram ",sizeof(rcv_tele*),new_telegram);
 
             new_telegram->data=telegram;
             new_telegram->len=param->data_ind.len;
@@ -625,15 +773,6 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
         // param->data_ind.data[4]='\3';
         // esp_err_t res=esp_spp_write(param->data_ind.handle, param->data_ind.len, param->data_ind.data);
         /* Send the address of xMessage to the queue created to hold 10    pointers. */
-
-
-#else
-        gettimeofday(&time_new, NULL);
-        data_num += param->data_ind.len;
-        if (time_new.tv_sec - time_old.tv_sec >= 3) {
-            print_speed();
-        }
-#endif
         break;
     case ESP_SPP_CONG_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_CONG_EVT");
@@ -647,7 +786,9 @@ static void esp_spp_cb(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
                  param->srv_open.handle, bda2str(param->srv_open.rem_bda, bda_str, sizeof(bda_str)));
         gettimeofday(&time_old, NULL);
         ESP_LOGI(SPP_TAG, "SAY HELLO TO LOG PC");
-        create_message(UI_DOMAIN,NULL,NULL,NULL,param->srv_open.handle);
+        //TODO:WAKEUP LOGPC
+        connection_established=true;
+        serial_handle=param->srv_open.handle;
         break;
     case ESP_SPP_SRV_STOP_EVT:
         ESP_LOGI(SPP_TAG, "ESP_SPP_SRV_STOP_EVT");
@@ -726,6 +867,188 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     return;
 }
 
+void timer_callback(TimerHandle_t xtimer)
+{
+    if ((uint32_t)pvTimerGetTimerID(xtimer)==0)
+    {
+        ESP_LOGI(TIM_CB, "timer 0 expired");
+        ESP_LOGI(TCH_PAD, "Switch off LED");
+        gpio_set_level(BLUE_LED, 0);
+    }
+}
+static void renew_timer()
+{
+
+    if (xTimerReset( xTimer_inactivity, 10 )==pdPASS)
+    {
+        ESP_LOGI(RNW_TIM, "Timer: %s has been reseted ", pcTimerGetName(xTimer_inactivity));
+        ESP_LOGI(RNW_TIM, "Switch on LED");
+        gpio_set_level(BLUE_LED, 1);
+    }
+} 
+
+
+/*
+  Read value sensed at available touch pad.
+  Use 2 / 3 of read value as the threshold
+  to trigger interrupt when the pad is touched.
+  Note: this routine demonstrates a simple way
+  to configure activation threshold for the touch pads.
+  Do not touch any pads when this routine
+  is running (on application start).
+ */
+ static void tp_example_set_thresholds(void)
+{
+    uint16_t touch_value;
+        //read filtered value
+        touch_pad_read_filtered(TOUCH_PAD_IO, &touch_value);
+        pad_init_val = touch_value;
+        ESP_LOGI(TCH_PAD, "test init: touch pad [%d] val is %d", TOUCH_PAD_IO, touch_value);
+        //set interrupt threshold.
+        //ESP_ERROR_CHECK(touch_pad_set_thresh(TOUCH_PAD_IO, touch_value * 2 / 3));
+} 
+
+/*
+  Check if any of touch pads has been activated
+  by reading a table updated by rtc_intr()
+  If so, then print it out on a serial monitor.
+  Clear related entry in the table afterwards
+
+  In interrupt mode, the table is updated in touch ISR.
+
+  In filter mode, we will compare the current filtered value with the initial one.
+  If the current filtered value is less than 80% of the initial value, we can
+  regard it as a 'touched' event.
+  When calling touch_pad_init, a timer will be started to run the filter.
+  This mode is designed for the situation that the pad is covered
+  by a 2-or-3-mm-thick medium, usually glass or plastic.
+  The difference caused by a 'touch' action could be very small, but we can still use
+  filter mode to detect a 'touch' event.
+ */
+static void tp_example_read_task(void *pvParameter)
+{
+    bool touch_state = false;
+    bool last_flicker_state = false;
+    bool last_steady_state = false;
+    TickType_t last_flicker = 0;
+    while(1)
+    {
+        uint16_t value = 0;
+        /* get filtered value */
+        touch_pad_read_filtered(TOUCH_PAD_IO, &value);
+        /* state of touch pad */
+        touch_state= (value < pad_init_val * TOUCH_THRESH_PERCENT / 100);
+        
+        /* state has been change */
+        if (touch_state != last_flicker_state)
+        {
+            /* store last flickering/change */
+            last_flicker = xTaskGetTickCount();
+            /* update state*/
+            last_flicker_state = touch_state;
+        }
+        
+        if(xTaskGetTickCount()-last_flicker>30)
+        {
+            
+            if (!last_steady_state && touch_state)
+            {
+                ESP_LOGI(TCH_PAD, "T%d activated!", TOUCH_PAD_IO);
+
+                if (xTimerIsTimerActive( xTimer_inactivity ) !=pdTRUE && connection_established)
+                {
+                    renew_timer();
+                    ESP_LOGI(TCH_PAD, "Switch on LED");
+                    gpio_set_level(BLUE_LED, 1);
+                    create_message(UI_DOMAIN,NULL,NULL,NULL,serial_handle);
+                }
+            }
+                    
+            if(last_steady_state && !touch_state)
+            {
+                ESP_LOGI(TCH_PAD, "T%d deactivated!", TOUCH_PAD_IO); 
+            }
+                
+
+                last_steady_state=touch_state;      
+        }
+            // ESP_LOGI(TCH_PAD, "T%d activated!", TOUCH_PAD_IO);
+            // ESP_LOGI(TCH_PAD, "value: %"PRIu16"; init val: %"PRIu32, value, pad_init_val);
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+
+}
+    
+
+static void tp_init()
+{
+    /* Set the GPIO as a push/pull output */
+    gpio_reset_pin(BLUE_LED);
+    gpio_set_direction(BLUE_LED, GPIO_MODE_OUTPUT);
+
+    // Initialize touch pad peripheral.
+    // The default fsm mode is software trigger mode.
+    ESP_ERROR_CHECK(touch_pad_init());
+
+    // If use interrupt trigger mode, should set touch sensor FSM mode at 'TOUCH_FSM_MODE_TIMER'.
+    // touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER);
+    
+    // Set reference voltage for charging/discharging
+    // For most usage scenarios, we recommend using the following combination:
+    // the high reference valtage will be 2.7V - 1V = 1.7V, The low reference voltage will be 0.5V.
+    touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_1V);
+
+    //init RTC IO and mode for touch pad.
+    touch_pad_config(0, TOUCH_THRESH_NO_USE);
+
+    // Initialize and start a software filter to detect slight change of capacitance.
+    touch_pad_filter_start(TOUCHPAD_FILTER_TOUCH_PERIOD);
+
+    // Set thresh hold
+    tp_example_set_thresholds();
+
+    // Create Mutex before it is used (in task or ISR)
+    // mtx_timer_expired = xSemaphoreCreateMutex();
+
+                xTimer_inactivity = xTimerCreate( " Inactivity timer",       // Just a text name, not used by the kernel.
+                5000 / portTICK_PERIOD_MS,   // The timer period in ticks.
+                pdFALSE,        // The timers will auto-reload themselves when they expire.
+                ( void * ) 0,  // Assign each timer a unique id equal to its array index.
+                timer_callback); // Each timer calls the same callback when it expires.
+        
+                if( xTimer_inactivity == NULL)        
+                {
+                    ESP_LOGI(TCH_PAD, "Timer: %s failed to create ", pcTimerGetName(xTimer_inactivity));
+                    return;
+                }
+                else
+                {
+                    ESP_LOGI(TCH_PAD, "Timer: %s has been created ", pcTimerGetName(xTimer_inactivity));
+                    // Start the timer.  No block time is specified, and even if one was
+                    // it would be ignored because the scheduler has not yet been
+                    // star
+                    if( xTimerStart( xTimer_inactivity, portMAX_DELAY) != pdPASS )
+                    {
+                        // The timer could not be set into the Active state.
+                    }
+                    ESP_LOGI(TCH_PAD, "Timer: %s has been started ", pcTimerGetName(xTimer_inactivity));
+                }  
+
+                if (xTimerIsTimerActive( xTimer_inactivity ))
+                {
+                        ESP_LOGI(TCH_PAD, "xTimer_inactivity active");
+                        ESP_LOGI(TCH_PAD, "Switch on LED");
+                        gpio_set_level(BLUE_LED, 1);
+                }
+                
+    // Register touch interrupt ISR task
+    // touch_pad_isr_register(tp_example_rtc_intr, NULL);
+    
+    // Start a task to show what pads have been touched
+    xTaskCreate(&tp_example_read_task, "touch_sensor_read_task", 4096, NULL, 5, NULL);
+}
+
 void app_main(void)
 {
     char bda_str[18] = {0};
@@ -796,17 +1119,17 @@ void app_main(void)
 
     ESP_LOGI(SPP_TAG, "Own address:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
 
-
     /* Create a queue capable of containing 10 char* */
     ReceivedQueue = xQueueCreate( 10, sizeof( rcv_tele* ) ); 
 
-    /* Task for process received telegrams */
-    TaskHandle_t ProcessMsgTaskHandle;
+    // /* Task for process received telegrams */
+    // TaskHandle_t ProcessMsgTaskHandle;
 
     /*Create task processing received telegram*/
     xTaskCreate(&process_telegram, "process_telegram", 2048,NULL,1,NULL );
 
-    
+    /* Touch pad init */
+    tp_init();
 
 //TODO: RSA encryption https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/api-reference/peripherals/ds.html
 }
