@@ -16,17 +16,32 @@ How does it work?
 PC application reads URL from the currently opened tab on the web browser (currently only Chrome).
 It sends afterward a request with the alias of URL and found login or/and password field.
 
-Application LogPC must contain hardcoded AutomationID of login field for interested us domain to be able successfully find credential fields. Password fields contain special property (IsPasswordProperty) that make it possible to recognize it without additional information.
+Application LogPC must contain hardcoded AutomationID of login field for interested us domain to be able successfully find credential fields. Password fields contain special property (IsPasswordProperty) that make it possible to recognize it without additional information.  
 
 
 ## RAW TELEGRAMS:
 
-|          LOGPC         |        LOG3SPE2        |          DESCRIPTION                                                                         | 
-| :---------------------:| :---------------------:|  -------------------------------------------------------------------------------------------:| 
-|                        |     `0(UI_DOMAIN)`     | LOG3SPE2 wakes-up LOGPC to search for known url and login fields                             |
-|  `1(UI_LOGIN) ,“boo”`  |                        | LOGPC found login field on website “boo” (alias is delivered)                                |
-|                        | `6(UI_MISSED) ,“boo”`  | LOG3SPE2 response with information that doesn’t have credentials for this website in storage |
-| ---------------------- | ---------------------- | ------------------------------------------------------------------------------------------   |
+|          LOGPC            |        LOG3SPE2                       |          DESCRIPTION                                                                         | 
+| :---------------------:   | :-----------------------------------: |  -------------------------------------------------------------------------------------------:| 
+|                           |         `0(UI_DOMAIN)`                | LOG3SPE2 wakes-up LOGPC to search for known url and login fields                             |
+|  `1(UI_LOGIN) ,“boo”`     |                                       | LOGPC found login field on website “boo” (alias is delivered)                                |
+|                           |       `6(UI_MISSED) ,“boo”`           | LOG3SPE2 response with information that doesn’t have credentials for this website in storage |
+| ----------------------    | ------------------------------------- | -------------------------------------------------------------------------------------------- |
+|                           |     `0(UI_DOMAIN)`                    | LOG3SPE2 wakes-up LOGPC to search for known url and login fields                             |
+| `1(UI_LOGIN) ,“yandex”`   |                                       | LOGPC found login field on website “yandex” (alias is delivered)                             |
+|                           |    `1(UI_LOGIN) ,“yandex”,"Adam"`     | LOG3SPE2 respond with found login related to "yandex" from NVS                               |
+| `4(UI_DONE) ,“yandex”`    |                                       | LOGPC acknowledges that credential has been inserted                                         |
+| ----------------------    | ------------------------------------- | -------------------------------------------------------------------------------------------- |
+|                           |     `0(UI_DOMAIN)`                    | LOG3SPE2 wakes-up LOGPC to search for known url and login fields                             |
+| `2(UI_PASSWORD) ,“google”`|                                       | LOGPC found login field on website “google” (alias is delivered)                             |
+|                           |    `2(UI_LOGIN) ,“google”,"1$%2as"`   | LOG3SPE2 respond with found login related to "google" from NVS                               |
+| `4(UI_DONE) ,“google”`    |                                       | LOGPC acknowledges that credential has been inserted                                         |
+| ----------------------    | ------------------------------------- | -------------------------------------------------------------------------------------------- |
+|                           |     `0(UI_DOMAIN)`                              | LOG3SPE2 wakes-up LOGPC to search for known url and login fields                   |
+| `3(UI_LOGPASS) ,“github”` |                                                 | LOGPC found login field on website “github” (alias is delivered)                   |
+|                           |  `3(UI_LOGPASS) ,“github”,"JOhn","qwerty123"`   | LOG3SPE2 respond with found login related to "github" from NVS                     |
+| `4(UI_DONE) ,“github”`    |                                                 | LOGPC acknowledges that credential has been inserted                               |
+| ----------------------    | ------------------------------------- | -------------------------------------------------------------------------------------------- |
 
 
 ## To be implemented
