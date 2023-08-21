@@ -126,15 +126,7 @@ static bool create_message(UI_ENUM element,const uint8_t* domain, const uint8_t*
     {
         ESP_LOGE(CRE_MSG, "Message mode invalid: %d ",element); 
         return false;
-    }
-    
-    // /*domain has null pointer*/
-    // if(!domain)
-    // {
-    //     ESP_LOGE(CRE_MSG, "Create message failed; domain value missing "); 
-    //     return false;
-    // }
-        
+    }      
 
         /* telegram pointer with maximal bytes in buffer */
         uint8_t message[MAX_TELEGRAM];
@@ -257,11 +249,6 @@ static uint8_t* logpass_concat(uint8_t* login, uint8_t* password)
 
     return logpass;
 }
-
-// static bool delete_from_nvs()
-// {
-
-// }
 
 static bool add_to_nvs(uint8_t* credential[3])
 {
