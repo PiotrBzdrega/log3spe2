@@ -81,7 +81,8 @@ typedef enum UI_ENUM
     UI_NEW_CREDENTIAL = 5,
     UI_ERASE = 6,
     UI_MISSED = 7,
-    UI_FAIL = 8,   
+    UI_FAIL = 8,
+    UI_STATS = 9,   
 }UI_ENUM;
 
 /* Queue for received telegrams */
@@ -463,6 +464,16 @@ static bool erase_from_nvs(uint8_t *key)
     return result;
 }
 
+static uint32_t usage_stats()
+{
+    //get overview of actual statistics of data entries :
+    nvs_stats_t nvs_stats;
+    nvs_get_stats(NULL, &nvs_stats);
+    ESP_LOGI(SPP_TAG,"Count: UsedEntries = (%u), FreeEntries = (%u), Usage = (%u%%) AllEntries = (%u)\n",
+    nvs_stats.used_entries, nvs_stats.free_entries, (nvs_stats.used_entries*100/nvs_stats.total_entries), nvs_stats.total_entries);
+    return (nvs_stats.used_entries*100/nvs_stats.total_entries);
+}
+
 /*Process incomming messages from SPP client*/
 static void process_telegram(void *arg)
 {
@@ -492,6 +503,7 @@ static void process_telegram(void *arg)
                 /*first and last character of element in telegram*/
                 int start_char,end_char=1;
 
+                //TODO: can happen that telegram will not contain comma (delete all or get statws)
                 /* correct separator after mode bytefield*/
                 if(tel->data[1]==',')
                 {
@@ -649,10 +661,18 @@ static void process_telegram(void *arg)
                         ESP_LOGI(TEL_TAG, "UI_MISSED telegram:%s",tel->data);
                         //TODO: missed telegram
                         break;    
-                   case UI_FAIL:
+                    case UI_FAIL:
                         ESP_LOGI(TEL_TAG, "UI_FAIL telegram:%s",tel->data);
                         //TODO: missed telegram
-                        break;                                                                               
+                        break;    
+                    case UI_STATS:
+                        ESP_LOGI(TEL_TAG, "UI_STATS telegram:%s",tel->data);
+                        /* max 3 characters "0"<->"100"*/
+                        char prc[3];
+                        /* int to char**/
+                        sprintf(prc,"%d",usage_stats());
+                        create_message(UI_STATS,prc,NULL,NULL,tel->handle);
+                        break;                                                                                 
                     default:
                         ESP_LOGE(TEL_TAG, "Undifined mode telegram:%s",tel->data);
                         break;
@@ -1058,6 +1078,7 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
+
 
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
 
